@@ -6,8 +6,6 @@ Colección propia de skills empaquetadas como marketplace de Claude Code. La
 primera, `/watch`, deja que Claude vea un vídeo — descarga, extrae frames,
 transcribe y responde con lo que realmente pasa en pantalla.
 
-
-
 ## Instalación
 
 ```bash
@@ -87,7 +85,6 @@ Notas generadas por `--save` sobre este propio repo.
 |---|---|
 | [best-practice/skill-portable.md](best-practice/skill-portable.md) | Cómo hacer una skill que funcione en cualquier harness |
 | [implementation/watch-derivado.md](implementation/watch-derivado.md) | Qué se cambió del original y por qué |
-| [CREDITS.md](CREDITS.md) | Atribución y licencia |
 | [CHANGELOG.md](CHANGELOG.md) | Historial de versiones |
 
 ## Desarrollo
@@ -102,4 +99,4 @@ el `PATH`, así que pasan en una máquina limpia y en CI.
 
 ## Licencia
 
-MIT. Ver [LICENSE](LICENSE) y [CREDITS.md](CREDITS.md).
+MIT. Ver [LICENSE](LICENSE) — conserva el copyright original de Bradley Bonanno junto al de las modificaciones.

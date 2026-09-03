@@ -3,7 +3,7 @@
 # `/watch`: qué cambia respecto al original
 
 Trabajo derivado de [bradautomates/claude-video](https://github.com/bradautomates/claude-video)
-(MIT). Atribución en [CREDITS.md](../CREDITS.md).
+(MIT). El copyright original se conserva en [LICENSE](../LICENSE).
 
 ## 1. El idioma dejaba fuera al español
 
