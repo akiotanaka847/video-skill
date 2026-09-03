@@ -6,9 +6,7 @@ Colección propia de skills empaquetadas como marketplace de Claude Code. La
 primera, `/watch`, deja que Claude vea un vídeo — descarga, extrae frames,
 transcribe y responde con lo que realmente pasa en pantalla.
 
-Derivado de [bradautomates/claude-video](https://github.com/bradautomates/claude-video)
-(MIT) con el español como ciudadano de primera, caché de transcripciones y
-persistencia a repositorio de conocimiento. Ver [CREDITS.md](CREDITS.md).
+
 
 ## Instalación
 
