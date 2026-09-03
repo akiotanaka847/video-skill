@@ -1,0 +1,20 @@
+# Excluye ficheros que no son de ejecución del `git archive` que usa
+# /plugin install y el empaquetado de skills.
+
+__pycache__/   export-ignore
+node_modules/  export-ignore
+*.pyc          export-ignore
+.DS_Store      export-ignore
+
+tests/         export-ignore
+best-practice/ export-ignore
+implementation/ export-ignore
+changelog/     export-ignore
+reports/       export-ignore
+
+.github/       export-ignore
+.gitignore     export-ignore
+.gitattributes export-ignore
+
+# NOTA: .claude-plugin/ NO se excluye — /plugin install descarga el archive
+# del repo completo y necesita el manifiesto para instalar.

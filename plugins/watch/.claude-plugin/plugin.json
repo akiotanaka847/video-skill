@@ -1,0 +1,12 @@
+{
+  "name": "watch",
+  "version": "1.0.0",
+  "description": "Deja que Claude vea un vídeo. Descarga con yt-dlp, extrae frames con ffmpeg, saca la transcripción de los subtítulos en tu idioma (o de Whisper con idioma y glosario forzados), cachea el resultado y puede guardar una nota markdown en tu repo.",
+  "author": {
+    "name": "Akio Tanaka"
+  },
+  "homepage": "https://github.com/akiotanaka847/video-skill",
+  "repository": "https://github.com/akiotanaka847/video-skill",
+  "license": "MIT",
+  "keywords": ["video", "watch", "youtube", "vimeo", "tiktok", "transcription", "whisper", "yt-dlp", "ffmpeg", "multimodal", "frames", "espanol", "spanish", "notes", "cache"]
+}

@@ -1,0 +1,21 @@
+{
+  "name": "video-skill",
+  "metadata": {
+    "description": "Skills propias para Claude Code. /watch le da ojos: descarga, extrae frames, transcribe en tu idioma y guarda la nota."
+  },
+  "owner": {
+    "name": "Akio Tanaka"
+  },
+  "plugins": [
+    {
+      "name": "watch",
+      "description": "Ver un vídeo (URL o fichero local): frames con ffmpeg, transcripción vía subtítulos o Whisper, con soporte de español, caché y notas markdown.",
+      "author": {
+        "name": "Akio Tanaka"
+      },
+      "source": "./plugins/watch",
+      "category": "productivity",
+      "homepage": "https://github.com/akiotanaka847/video-skill"
+    }
+  ]
+}
