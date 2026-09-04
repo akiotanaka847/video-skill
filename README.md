@@ -21,16 +21,15 @@ vídeos sin subtítulos.
 
 | Skill | Qué hace | Docs |
 |---|---|---|
-| [`/watch`](plugins/watch/skills/watch/SKILL.md) | Ver un vídeo: frames + transcripción, con soporte de español, caché y notas | [implementación](implementation/watch-derivado.md) |
+| [`/watch`](plugins/watch/skills/watch/SKILL.md) | Ver un vídeo: frames + transcripción, con soporte de español, caché y notas | [diseño](implementation/watch-diseno.md) |
 
-## Por qué existe este fork
+## Qué resuelve
 
-El original está muy bien hecho, pero tenía el idioma de subtítulos fijado a
-inglés en tres sitios. Un vídeo en español **con subtítulos en español perfectos**
-devolvía cero captions y caía a Whisper de pago. Para quien trabaja en español ese
-no es un detalle: es el camino feliz roto.
+La mayoría de herramientas de vídeo asumen inglés: piden los subtítulos en inglés
+y, si el vídeo está en español, se quedan sin captions y caen a transcripción de
+pago. Aquí el idioma es configurable de punta a punta.
 
-De ahí salieron cuatro cambios:
+Cuatro capacidades:
 
 1. **Español de primera** — `WATCH_SUB_LANGS` (por defecto `es,en`), y para Whisper
    `--whisper-lang` y `--glossary` con tu vocabulario de dominio.
@@ -56,8 +55,8 @@ Guardando nota en un repo de conocimiento:
 
 ## Configuración
 
-`~/.config/video-skill/.env` (permisos `0600`). Si ya tenías el proyecto original
-instalado, tus claves de `~/.config/watch/.env` se heredan solas.
+`~/.config/video-skill/.env` (permisos `0600`). Un `~/.config/watch/.env` previo
+se lee como respaldo, así que las claves que ya tuvieras ahí se heredan solas.
 
 | Variable | Por defecto | Qué controla |
 |---|---|---|
@@ -84,7 +83,7 @@ Notas generadas por `--save` sobre este propio repo.
 | Doc | Contenido |
 |---|---|
 | [best-practice/skill-portable.md](best-practice/skill-portable.md) | Cómo hacer una skill que funcione en cualquier harness |
-| [implementation/watch-derivado.md](implementation/watch-derivado.md) | Qué se cambió del original y por qué |
+| [implementation/watch-diseno.md](implementation/watch-diseno.md) | Decisiones de diseño y por qué |
 | [CHANGELOG.md](CHANGELOG.md) | Historial de versiones |
 
 ## Desarrollo
@@ -99,4 +98,4 @@ el `PATH`, así que pasan en una máquina limpia y en CI.
 
 ## Licencia
 
-MIT. Ver [LICENSE](LICENSE) — conserva el copyright original de Bradley Bonanno junto al de las modificaciones.
+MIT. Ver [LICENSE](LICENSE).

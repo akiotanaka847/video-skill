@@ -20,7 +20,7 @@ MAX_FPS = 2.0
 SCENE_THRESHOLD = 0.20
 # Keep scene-detection results once we have at least this many distinct shots.
 # Below this the video is effectively static (screen recording, talking head),
-# so we fall back to uniform sampling. Matching the reference fork's behaviour,
+# so we fall back to uniform sampling. To keep coverage predictable,
 # this is a low floor — NOT the frame budget — so normal videos with cuts use
 # the (single-pass) scene engine instead of paying for a wasted second decode.
 SCENE_MIN_FRAMES = 8

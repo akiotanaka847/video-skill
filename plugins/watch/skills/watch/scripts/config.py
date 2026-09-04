@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Shared /watch configuration helpers.
 
-Reads ~/.config/video-skill/.env, falling back to ~/.config/watch/.env so an
-existing upstream claude-video install carries its API keys over unchanged.
-Environment variables always win over both files.
+Reads ~/.config/video-skill/.env, falling back to a legacy ~/.config/watch/.env
+so API keys already stored there carry over unchanged. Environment variables
+always win over both files.
 """
 from __future__ import annotations
 
@@ -14,8 +14,8 @@ from pathlib import Path
 CONFIG_DIR = Path.home() / ".config" / "video-skill"
 CONFIG_FILE = CONFIG_DIR / ".env"
 
-# Upstream (bradautomates/claude-video) location. Read-only fallback: we never
-# write here, so an existing install keeps working and its keys are inherited.
+# Legacy location. Read-only fallback: we never write here, so anything already
+# configured there keeps working and its keys are inherited.
 LEGACY_CONFIG_FILE = Path.home() / ".config" / "watch" / ".env"
 
 CACHE_DIR = Path(
@@ -25,9 +25,9 @@ CACHE_DIR = Path(
 DEFAULT_DETAIL = "balanced"
 DETAILS = {"transcript", "efficient", "balanced", "token-burner"}
 
-# Caption languages to request, in preference order. Upstream hardcoded "en.*"
-# in three places, which meant a Spanish video with perfect Spanish subtitles
-# returned zero captions and fell through to paid Whisper.
+# Caption languages to request, in preference order. Hardcoding English here
+# would mean a Spanish video with perfect Spanish subtitles returns zero
+# captions and falls through to paid Whisper.
 DEFAULT_SUB_LANGS = "es,en"
 
 

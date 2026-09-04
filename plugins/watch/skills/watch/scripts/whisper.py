@@ -92,8 +92,8 @@ def load_api_key(preferred: str | None = None) -> tuple[str, str] | tuple[None, 
 
     dotenv_paths = [
         Path.home() / ".config" / "video-skill" / ".env",
-        # Inherited from an existing bradautomates/claude-video install, so a
-        # user who already configured Whisper there needs no second setup.
+        # Legacy path: a Whisper key already configured there is inherited, so
+        # there is no need to set one up a second time.
         Path.home() / ".config" / "watch" / ".env",
         Path.cwd() / ".env",
     ]

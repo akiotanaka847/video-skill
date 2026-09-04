@@ -51,7 +51,7 @@ On follow-up calls in the same session use the silent check — `python3 "${SKIL
 
 A missing Whisper key is *encouraged to fix, not required*. Keyless installs are allowed and are never nagged once `SETUP_COMPLETE=true`.
 
-**Config inheritance:** if the user already had `bradautomates/claude-video` installed, `~/.config/watch/.env` is read as a fallback, so their existing Groq/OpenAI key carries over and they do not need to set it up twice. We never write to that file.
+**Config inheritance:** a legacy `~/.config/watch/.env` is read as a fallback, so a Groq/OpenAI key already stored there carries over and does not need to be set up twice. We never write to that file.
 
 ### First-run questions
 

@@ -62,4 +62,4 @@ a un sitio específico de un solo harness.
    recorren el repo entero; sin él, tus tests y tu CI se auditan como si fueran
    código de ejecución.
 
-Ver también: [implementation/watch-derivado.md](../implementation/watch-derivado.md).
+Ver también: [implementation/watch-diseno.md](../implementation/watch-diseno.md).
