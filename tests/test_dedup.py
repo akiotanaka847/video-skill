@@ -126,7 +126,7 @@ def test_dedupe_perceptual_keeps_distinct_cuts(cut_clip: Path, tmp_path: Path):
 
 def test_scene_engine_reports_zero_dedup_on_distinct(cut_clip: Path, tmp_path: Path):
     out, meta = frames.extract_scene_or_uniform(
-        str(cut_clip), tmp_path / "f", fps=2.0, target_frames=50, max_frames=100,
+        str(cut_clip), tmp_path / "f", fps=2.0, target_frames=50, max_frames=100, fast=False,
     )
     assert meta["engine"] == "scene"
     assert meta["deduped_count"] == 0
@@ -135,7 +135,7 @@ def test_scene_engine_reports_zero_dedup_on_distinct(cut_clip: Path, tmp_path: P
 
 def test_uniform_fallback_dedupes_static(static_clip: Path, tmp_path: Path):
     out, meta = frames.extract_scene_or_uniform(
-        str(static_clip), tmp_path / "f", fps=4.0, target_frames=12, max_frames=100,
+        str(static_clip), tmp_path / "f", fps=4.0, target_frames=12, max_frames=100, fast=False,
     )
     assert meta["engine"] == "uniform"
     assert meta["fallback"] is True

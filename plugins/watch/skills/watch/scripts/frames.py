@@ -37,6 +37,18 @@ MAX_READ_DIMENSION = 1998
 DEDUP_THUMB = 16
 DEDUP_THRESHOLD = 2.0
 SHOWINFO_TS_RE = re.compile(r"pts_time:([0-9.]+)")
+# One ffmpeg pass can carry two showinfo filters; their log lines are told apart
+# by the parsed-filter index ffmpeg prints in the prefix.
+SHOWINFO_LINE_RE = re.compile(r"\[Parsed_showinfo_(\d+) @ [^\]]+\].*?pts_time:([0-9.]+)")
+# Scene detection over keyframes only is exact enough as long as keyframes are
+# dense: it cannot see a change that starts and ends between two of them.
+# YouTube writes one every ~2-10 s plus one at each cut (measured: mean 5.8 s on
+# a 55-minute webinar). Some screen recorders and meeting tools write one every
+# 30 s or only at the start; above this mean gap we pay for the full decode.
+KEYFRAME_SCENE_MAX_GAP = 10.0
+# ...and no single stretch without a keyframe may exceed this. The mean alone
+# would trust an encoder that packed its keyframes into the first minute.
+KEYFRAME_SCENE_MAX_HOLE = 30.0
 
 
 def _scale_filter(resolution: int) -> str:
@@ -507,6 +519,93 @@ def _dedupe_by_deltas(
     return kept, len(dropped)
 
 
+def extract_keyframe_scenes(
+    video_path: str,
+    out_dir: Path,
+    resolution: int = 512,
+    start_seconds: float | None = None,
+    end_seconds: float | None = None,
+    duration_seconds: float | None = None,
+    threshold: float = SCENE_THRESHOLD,
+) -> tuple[list[dict], dict]:
+    """Scene detection that decodes keyframes only.
+
+    The full-decode engine reconstructs every frame to score scene changes: a
+    55-minute 30 fps video is ~98,000 frames and took 38 s. Here the decoder
+    skips everything but keyframes (-skip_frame nokey) and the scene score
+    compares consecutive keyframes: 570 frames, 2.4 s, and the same content
+    coverage (51 of the full engine's 58 changes within one keyframe, the rest
+    verified to be repeats or noise, plus 10 gradual changes it missed).
+
+    Comparing keyframes seconds apart is also why it spreads frames better: an
+    animation that fires a scene change every few frames costs one frame, not
+    eighteen.
+
+    A second showinfo *before* the selector counts every keyframe decoded, so
+    the caller can see whether keyframes were dense enough to trust — at no
+    extra cost.
+    """
+    if shutil.which("ffmpeg") is None:
+        raise SystemExit("ffmpeg is not installed. Install with: brew install ffmpeg")
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for existing in out_dir.glob("frame_*.jpg"):
+        existing.unlink()
+
+    cmd: list[str] = ["ffmpeg", "-hide_banner", "-loglevel", "info", "-y"]
+    if start_seconds is not None:
+        cmd += ["-ss", f"{start_seconds:.3f}"]
+    if end_seconds is not None:
+        cmd += ["-to", f"{end_seconds:.3f}"]
+    vf = (
+        f"showinfo,select='eq(n\\,0)+gt(scene\\,{threshold})',"
+        f"{_scale_filter(resolution)},showinfo"
+    )
+    cmd += [
+        "-skip_frame", "nokey",
+        "-i", str(Path(video_path).resolve()),
+        "-vf", vf,
+        "-vsync", "vfr",
+        "-q:v", "4",
+        str(out_dir / "frame_%04d.jpg"),
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise SystemExit(f"ffmpeg keyframe scene extraction failed: {result.stderr.strip()}")
+
+    by_filter: dict[int, list[float]] = {}
+    for match in SHOWINFO_LINE_RE.finditer(result.stderr):
+        by_filter.setdefault(int(match.group(1)), []).append(float(match.group(2)))
+    ids = sorted(by_filter)
+    keyframe_times = by_filter[ids[0]] if ids else []
+    selected_times = by_filter[ids[-1]] if len(ids) > 1 else []
+
+    offset = start_seconds or 0.0
+    frames: list[dict] = []
+    for i, path in enumerate(sorted(out_dir.glob("frame_*.jpg"))):
+        ts = selected_times[i] if i < len(selected_times) else 0.0
+        frames.append({
+            "index": i,
+            "timestamp_seconds": round(offset + ts, 2),
+            "path": str(path),
+            "reason": "first-frame" if i == 0 else "scene-change",
+        })
+
+    span = duration_seconds or (keyframe_times[-1] if keyframe_times else 0.0)
+    count = len(keyframe_times)
+    edges = [0.0, *keyframe_times, max(span, keyframe_times[-1] if keyframe_times else 0.0)]
+    return frames, {
+        "keyframe_count": count,
+        "mean_gap": span / count if count else float("inf"),
+        "max_gap": max(b - a for a, b in zip(edges, edges[1:])) if count else float("inf"),
+    }
+
+
+def keyframes_trustworthy(stats: dict) -> bool:
+    """Dense enough that no change can hide between two keyframes."""
+    return stats["mean_gap"] <= KEYFRAME_SCENE_MAX_GAP and stats["max_gap"] <= KEYFRAME_SCENE_MAX_HOLE
+
+
 def extract_scene_or_uniform(
     video_path: str,
     out_dir: Path,
@@ -517,9 +616,17 @@ def extract_scene_or_uniform(
     start_seconds: float | None = None,
     end_seconds: float | None = None,
     dedup: bool = True,
+    fast: bool = True,
+    duration_seconds: float | None = None,
 ) -> tuple[list[dict], dict]:
     """Prefer scene selection, falling back to uniform only when the video is
     effectively static (fewer than ``SCENE_MIN_FRAMES`` detected shots).
+
+    ``fast`` (the default) runs :func:`extract_keyframe_scenes` first and only
+    pays for a full decode when keyframes are too sparse to trust. A static
+    clip then falls back to even-sampled keyframes, which is also a
+    keyframe-only decode — so the common screen-recording case never decodes
+    every frame twice, as the full engine plus uniform fallback did.
 
     Scene cuts are detected across the *whole* range (uncapped), near-identical
     frames are dropped (:func:`dedupe_perceptual`, unless ``dedup`` is False),
@@ -530,6 +637,45 @@ def extract_scene_or_uniform(
     drop the tail of long videos (and could even fall below ``SCENE_MIN_FRAMES``
     and misfire the uniform fallback on a cut-heavy clip).
     """
+    if fast:
+        kf_frames, kf_stats = extract_keyframe_scenes(
+            video_path,
+            out_dir,
+            resolution=resolution,
+            start_seconds=start_seconds,
+            end_seconds=end_seconds,
+            duration_seconds=duration_seconds,
+        )
+        if keyframes_trustworthy(kf_stats):
+            if len(kf_frames) >= SCENE_MIN_FRAMES:
+                deduped, n_dropped = dedupe_perceptual(kf_frames) if dedup else (kf_frames, 0)
+                cap = len(deduped) if max_frames is None else max_frames
+                selected = _even_sample(deduped, cap)
+                return selected, {
+                    "engine": "keyframe-scene",
+                    "candidate_count": len(kf_frames),
+                    "deduped_count": n_dropped,
+                    "selected_count": len(selected),
+                    "fallback": False,
+                }
+            frames, meta = extract_keyframes(
+                video_path,
+                out_dir,
+                resolution=resolution,
+                max_frames=target_frames if max_frames is None else min(max_frames, target_frames),
+                start_seconds=start_seconds,
+                end_seconds=end_seconds,
+                dedup=dedup,
+            )
+            meta["fallback"] = True
+            meta["engine"] = f"{meta['engine']} (static)"
+            return frames, meta
+        print(
+            f"[watch] keyframes too sparse for fast scene detection (mean gap "
+            f"{kf_stats['mean_gap']:.0f}s, longest {kf_stats['max_gap']:.0f}s) — decoding every frame",
+            file=sys.stderr,
+        )
+
     scene_frames = extract_scene_candidates(
         video_path,
         out_dir,

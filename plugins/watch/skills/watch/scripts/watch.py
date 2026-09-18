@@ -1,14 +1,22 @@
 #!/usr/bin/env python3
 """/watch entry point: download video, extract frames, parse transcript.
 
-Prints a markdown report to stdout listing frame paths + transcript. Claude
-then Reads each frame path to see the video.
+Prints a markdown report to stdout listing contact sheets + transcript. Claude
+then Reads each sheet to see the video.
+
+After one metadata probe the work splits into two lanes that run at the same
+time: the transcript (a caption track, or audio + Whisper) and the visual side
+(video + frames + sheets). One is network-bound and the other CPU-bound, so the
+run takes as long as the slower lane instead of the sum of both.
 """
 from __future__ import annotations
 
 import argparse
+import shutil
 import sys
 import tempfile
+import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 
@@ -16,14 +24,38 @@ SCRIPT_DIR = Path(__file__).parent.resolve()
 sys.path.insert(0, str(SCRIPT_DIR))
 
 SUMMARY_PLACEHOLDER = "<!-- RESUMEN: pendiente -->"
+# Marks a temp work dir as ours, so the stale-dir sweep never touches anything
+# it did not create.
+WORKDIR_MARKER = ".watch-workdir"
+STALE_WORKDIR_HOURS = 24
 
 import cache as transcript_cache  # noqa: E402
 import notes as note_writer  # noqa: E402
 from config import frame_cap, get_config  # noqa: E402
-from download import download, fetch_captions, is_url  # noqa: E402
+from download import choose_caption_track, download_audio, download_video, fetch_subtitle, is_url, probe, resolve_local  # noqa: E402
 from frames import MAX_FPS, auto_fps, auto_fps_focus, extract_at_timestamps, extract_keyframes, extract_scene_or_uniform, format_time, get_metadata, merge_frames, parse_time, parse_timestamps  # noqa: E402
+from sheets import build_sheets, format_label  # noqa: E402
 from transcribe import filter_range, format_transcript, parse_vtt  # noqa: E402
 from whisper import load_api_key, transcribe_video  # noqa: E402
+
+
+def sweep_stale_workdirs(max_age_hours: float = STALE_WORKDIR_HOURS) -> int:
+    """Delete our own temp work dirs older than ``max_age_hours``.
+
+    Replaces the agent's end-of-run `rm -rf`: that was one more tool round trip
+    per watch, and skipping it leaked video files. Only dirs carrying our
+    marker are touched.
+    """
+    cutoff = time.time() - max_age_hours * 3600
+    removed = 0
+    for candidate in Path(tempfile.gettempdir()).glob("watch-*"):
+        try:
+            if (candidate / WORKDIR_MARKER).exists() and candidate.stat().st_mtime < cutoff:
+                shutil.rmtree(candidate, ignore_errors=True)
+                removed += 1
+        except OSError:
+            continue
+    return removed
 
 
 def main() -> int:
@@ -96,6 +128,11 @@ def main() -> int:
         help="Force a specific Whisper backend. Default: prefer Groq, fall back to OpenAI.",
     )
     ap.add_argument(
+        "--no-sheets",
+        action="store_true",
+        help="List individual frames instead of tiling them into contact sheets.",
+    )
+    ap.add_argument(
         "--no-dedup",
         action="store_true",
         help="Disable near-duplicate frame removal. Keeps visually identical "
@@ -126,7 +163,9 @@ def main() -> int:
     if args.out_dir:
         work = Path(args.out_dir).expanduser().resolve()
     else:
+        sweep_stale_workdirs()
         work = Path(tempfile.mkdtemp(prefix="watch-"))
+        (work / WORKDIR_MARKER).touch()
     work.mkdir(parents=True, exist_ok=True)
     print(f"[watch] working dir: {work}", file=sys.stderr)
 
@@ -135,210 +174,235 @@ def main() -> int:
     cache_hit = cached is not None
 
     url_source = is_url(args.source)
-    dl: dict = {"subtitle_path": None, "info": {}, "downloaded": False}
-    transcript_segments: list[dict] = []
-    transcript_text: str | None = None
-    transcript_source: str | None = None
-    transcript_lang: str | None = None
-    all_transcript_segments: list[dict] = []
-    video_path: str | None = None
+    need_video = detail != "transcript" or bool(cue_timestamps)
 
-    if cache_hit:
-        all_transcript_segments = cached["segments"]
-        transcript_segments = list(all_transcript_segments)
-        transcript_source = cached.get("transcript_source", "cached")
-        transcript_lang = cached.get("language")
+    # Missing tools must stop the run with a pointer to the installer, not
+    # degrade into "frames unavailable" (which the agent would answer around).
+    required = (["yt-dlp"] if url_source else []) + ["ffmpeg", "ffprobe"]
+    missing = [tool for tool in required if shutil.which(tool) is None]
+    if missing:
         print(
-            f"[watch] transcript cache hit ({len(transcript_segments)} segments, "
-            f"{transcript_source}) — skipping caption fetch",
+            f"[watch] {', '.join(missing)} is not installed. "
+            f"Run: python3 {SCRIPT_DIR / 'setup.py'}",
             file=sys.stderr,
         )
-        transcript_text = format_transcript(transcript_segments)
+        return 2
+    backend, api_key = (None, None) if args.no_whisper else load_api_key(args.whisper)
+    whisper_ready = bool(backend and api_key)
 
-    if url_source and not cache_hit:
-        print("[watch] checking metadata/captions via yt-dlp…", file=sys.stderr)
-        dl = fetch_captions(args.source, work / "download", sub_langs=sub_langs)
-        if dl.get("subtitle_path"):
-            try:
-                transcript_segments = parse_vtt(dl["subtitle_path"])
-                all_transcript_segments = list(transcript_segments)
-                transcript_text = format_transcript(transcript_segments)
-                transcript_source = "captions"
-                transcript_lang = dl.get("subtitle_lang")
-            except Exception as exc:
-                print(f"[watch] subtitle parse failed: {exc}", file=sys.stderr)
-                transcript_segments = []
-
-    # --timestamps needs the video for frame grabs, so it overrides the
-    # transcript-mode download skip (and forces a full, not audio-only, fetch).
-    audio_only = detail == "transcript" and not cue_timestamps
-    if detail == "transcript" and transcript_segments and not cue_timestamps:
-        video_path = None
-    else:
-        if url_source:
-            print(
-                "[watch] downloading audio via yt-dlp…" if audio_only
-                else "[watch] downloading video via yt-dlp…",
-                file=sys.stderr,
-            )
-            dl = download(
-                args.source,
-                work / "download",
-                audio_only=audio_only,
-                sub_langs=sub_langs,
-            )
-        else:
-            print("[watch] using local file…", file=sys.stderr)
-            dl = download(args.source, work / "download")
-        video_path = dl["video_path"]
-
-    meta = get_metadata(video_path) if video_path else {
-        "duration_seconds": float((dl.get("info") or {}).get("duration") or 0),
-        "width": None,
-        "height": None,
-        "codec": None,
-        "has_audio": False,
-    }
-    full_duration = meta["duration_seconds"]
+    # One extraction for everything that follows: every yt-dlp call below
+    # replays this info.json instead of re-extracting (~3-4 s each on YouTube).
+    probed: dict = {"info_json": None, "raw": {}, "info": {"url": args.source}}
+    track: dict | None = None
+    if url_source and (need_video or not cache_hit):
+        print("[watch] probing metadata and captions via yt-dlp…", file=sys.stderr)
+        probed = probe(args.source, work / "download")
+        if not cache_hit:
+            track = choose_caption_track(probed["raw"], sub_langs)
+            if track:
+                print(f"[watch] caption track: {track['lang']} ({track['kind']})", file=sys.stderr)
 
     start_sec = parse_time(args.start)
     end_sec = parse_time(args.end)
-
     if start_sec is not None and start_sec < 0:
         raise SystemExit("--start must be non-negative")
     if end_sec is not None and start_sec is not None and end_sec <= start_sec:
         raise SystemExit("--end must be greater than --start")
-    if full_duration > 0 and start_sec is not None and start_sec >= full_duration:
-        raise SystemExit(f"--start {start_sec:.1f}s is past end of video ({full_duration:.1f}s)")
-
-    effective_start = start_sec if start_sec is not None else 0.0
-    effective_end = end_sec if end_sec is not None else full_duration
-    effective_duration = max(0.0, effective_end - effective_start)
     focused = start_sec is not None or end_sec is not None
-
-    if focused:
-        fps, target = auto_fps_focus(effective_duration, max_frames=budget_cap)
-    else:
-        fps, target = auto_fps(effective_duration, max_frames=budget_cap)
-    if args.fps is not None:
-        fps = min(args.fps, MAX_FPS)
-        target = max(1, int(round(fps * effective_duration)))
-
-    if transcript_segments and focused:
-        # Always filter from the unfiltered copy: a cached entry stores the full
-        # transcript so a later run can ask for a different range for free.
-        base = all_transcript_segments or transcript_segments
-        transcript_segments = filter_range(base, start_sec, end_sec)
-        transcript_text = format_transcript(transcript_segments)
-
-    scope = (
-        f"{format_time(effective_start)}-{format_time(effective_end)} ({effective_duration:.1f}s)"
-        if focused else f"full {effective_duration:.1f}s"
+    known_duration = float(probed["info"].get("duration") or 0) if url_source else (
+        get_metadata(args.source)["duration_seconds"] if Path(args.source).expanduser().exists() else 0.0
     )
-    frames: list[dict] = []
-    frame_meta: dict = {"engine": "none", "candidate_count": 0, "selected_count": 0, "fallback": False}
-    cue_frames: list[dict] = []
-    cue_meta: dict = {}
+    if known_duration and start_sec is not None and start_sec >= known_duration:
+        raise SystemExit(f"--start {start_sec:.1f}s is past end of video ({known_duration:.1f}s)")
 
-    # Transcript cues are pinned: extracted first and counted against the cap so
-    # the detail engine never evicts the moments the user explicitly asked for.
-    if cue_timestamps and video_path:
-        cue_frames, cue_meta = extract_at_timestamps(
-            video_path,
-            work / "frames",
-            cue_timestamps,
-            resolution=args.resolution,
-            max_frames=max_frames,
-            start_seconds=start_sec,
-            end_seconds=end_sec,
+    def whisper_from(media: str) -> dict:
+        segments, used = transcribe_video(
+            media,
+            work / "audio.mp3",
+            backend=backend,
+            api_key=api_key,
+            language=whisper_lang or None,
+            prompt=glossary or None,
         )
-        if cue_meta.get("dropped_out_of_window"):
-            print(
-                f"[watch] {cue_meta['dropped_out_of_window']} cue timestamp(s) outside the "
-                "focus range — dropped",
-                file=sys.stderr,
-            )
+        return {"segments": segments, "source": f"whisper ({used})", "lang": whisper_lang or "auto"}
 
-    detail_budget = max_frames if max_frames is None else max(0, max_frames - len(cue_frames))
-    if detail != "transcript" and video_path and detail_budget != 0:
-        cap_label = "unlimited" if detail_budget is None else str(detail_budget)
-        engine_label = "keyframes" if detail == "efficient" else "scene-aware frames"
-        print(
-            f"[watch] extracting {engine_label} over {scope} "
-            f"(target {target}, cap {cap_label})…",
-            file=sys.stderr,
-        )
-        if detail == "efficient":
-            frames, frame_meta = extract_keyframes(
-                video_path,
-                work / "frames",
-                resolution=args.resolution,
-                max_frames=detail_budget,
-                start_seconds=start_sec,
-                end_seconds=end_sec,
-                dedup=not args.no_dedup,
-            )
-        else:  # balanced, token-burner
-            frames, frame_meta = extract_scene_or_uniform(
-                video_path,
-                work / "frames",
-                fps=fps,
-                target_frames=target,
-                resolution=args.resolution,
-                max_frames=detail_budget,
-                start_seconds=start_sec,
-                end_seconds=end_sec,
-                dedup=not args.no_dedup,
-            )
-
-    if cue_frames:
-        frames = merge_frames(frames, cue_frames)
-
-    if not transcript_segments and dl.get("subtitle_path"):
+    def transcript_lane() -> dict:
+        """Captions if there is a track, else audio + Whisper. Never raises for
+        an expected miss: a video without a transcript still gets frames."""
+        if cache_hit:
+            return {
+                "segments": cached["segments"],
+                "source": cached.get("transcript_source", "cached"),
+                "lang": cached.get("language"),
+            }
+        if track:
+            subtitle = fetch_subtitle(args.source, work / "download", track, probed["info_json"])
+            if subtitle:
+                try:
+                    return {
+                        "segments": parse_vtt(str(subtitle)),
+                        "source": f"captions ({track['kind']})",
+                        "lang": track["lang"],
+                        "had_captions": True,
+                    }
+                except Exception as exc:
+                    print(f"[watch] subtitle parse failed: {exc}", file=sys.stderr)
+        if not whisper_ready:
+            return {}
         try:
-            all_segments = parse_vtt(dl["subtitle_path"])
-            all_transcript_segments = list(all_segments)
-            transcript_segments = filter_range(all_segments, start_sec, end_sec) if focused else all_segments
-            transcript_text = format_transcript(transcript_segments)
-            transcript_source = "captions"
-            transcript_lang = dl.get("subtitle_lang")
-        except Exception as exc:
-            print(f"[watch] subtitle parse failed: {exc}", file=sys.stderr)
+            if not url_source:
+                if not get_metadata(args.source).get("has_audio"):
+                    print("[watch] no audio stream found — proceeding without transcription", file=sys.stderr)
+                    return {}
+                return whisper_from(args.source)
+            print("[watch] no captions — downloading audio for Whisper…", file=sys.stderr)
+            audio = download_audio(args.source, work / "audio", probed["info_json"])
+            if audio is None:
+                # Muxed-only sites: fetch the (small) muxed file into its own
+                # dir so it never races the visual lane's download.
+                audio = download_video(args.source, work / "audio", info_json=probed["info_json"])
+            return whisper_from(str(audio))
+        except SystemExit as exc:
+            print(f"[watch] whisper fallback failed: {exc}", file=sys.stderr)
+            return {}
 
-    if not transcript_segments and not args.no_whisper and video_path and meta.get("has_audio"):
-        backend, api_key = load_api_key(args.whisper)
-        if backend and api_key:
-            try:
-                all_segments, used_backend = transcribe_video(
-                    video_path,
-                    work / "audio.mp3",
-                    backend=backend,
-                    api_key=api_key,
-                    language=whisper_lang or None,
-                    prompt=glossary or None,
-                )
-                all_transcript_segments = list(all_segments)
-                transcript_segments = filter_range(all_segments, start_sec, end_sec) if focused else all_segments
-                transcript_text = format_transcript(transcript_segments)
-                transcript_source = f"whisper ({used_backend})"
-                transcript_lang = whisper_lang or "auto"
-            except SystemExit as exc:
-                print(f"[watch] whisper fallback failed: {exc}", file=sys.stderr)
+    def visual_lane() -> dict:
+        if not need_video:
+            return {}
+        if url_source:
+            print("[watch] downloading video via yt-dlp…", file=sys.stderr)
+            video = str(download_video(
+                args.source, work / "video", resolution=args.resolution, info_json=probed["info_json"],
+            ))
         else:
-            hint = (
-                f"--whisper {args.whisper} was set but the matching API key is missing"
-                if args.whisper else
-                "no subtitles and no Whisper API key found"
+            print("[watch] using local file…", file=sys.stderr)
+            video = resolve_local(args.source)["video_path"]
+        meta = get_metadata(video)
+        duration = meta["duration_seconds"]
+        if duration > 0 and start_sec is not None and start_sec >= duration:
+            raise SystemExit(f"--start {start_sec:.1f}s is past end of video ({duration:.1f}s)")
+        eff_start = start_sec if start_sec is not None else 0.0
+        eff_end = end_sec if end_sec is not None else duration
+        eff_duration = max(0.0, eff_end - eff_start)
+        if focused:
+            fps, target = auto_fps_focus(eff_duration, max_frames=budget_cap)
+        else:
+            fps, target = auto_fps(eff_duration, max_frames=budget_cap)
+        if args.fps is not None:
+            fps = min(args.fps, MAX_FPS)
+            target = max(1, int(round(fps * eff_duration)))
+
+        cue_frames: list[dict] = []
+        cue_meta: dict = {}
+        # Transcript cues are pinned: extracted first and counted against the cap
+        # so the detail engine never evicts the moments the user asked for.
+        if cue_timestamps:
+            cue_frames, cue_meta = extract_at_timestamps(
+                video, work / "frames", cue_timestamps, resolution=args.resolution,
+                max_frames=max_frames, start_seconds=start_sec, end_seconds=end_sec,
             )
-            setup_py = SCRIPT_DIR / "setup.py"
+            if cue_meta.get("dropped_out_of_window"):
+                print(
+                    f"[watch] {cue_meta['dropped_out_of_window']} cue timestamp(s) outside the "
+                    "focus range — dropped",
+                    file=sys.stderr,
+                )
+
+        budget = max_frames if max_frames is None else max(0, max_frames - len(cue_frames))
+        frames: list[dict] = []
+        frame_meta: dict = {"engine": "none", "candidate_count": 0, "selected_count": 0, "fallback": False}
+        if detail != "transcript" and budget != 0:
+            scope = (
+                f"{format_time(eff_start)}-{format_time(eff_end)} ({eff_duration:.1f}s)"
+                if focused else f"full {eff_duration:.1f}s"
+            )
+            print(f"[watch] extracting frames over {scope} (target {target}, cap "
+                  f"{'unlimited' if budget is None else budget})…", file=sys.stderr)
+            if detail == "efficient":
+                frames, frame_meta = extract_keyframes(
+                    video, work / "frames", resolution=args.resolution, max_frames=budget,
+                    start_seconds=start_sec, end_seconds=end_sec, dedup=not args.no_dedup,
+                )
+            else:
+                frames, frame_meta = extract_scene_or_uniform(
+                    video, work / "frames", fps=fps, target_frames=target,
+                    resolution=args.resolution, max_frames=budget,
+                    start_seconds=start_sec, end_seconds=end_sec, dedup=not args.no_dedup,
+                    # token-burner opted into maximum fidelity: keep the full decode.
+                    fast=detail != "token-burner", duration_seconds=eff_duration,
+                )
+        if cue_frames:
+            frames = merge_frames(frames, cue_frames)
+        sheets = [] if args.no_sheets else build_sheets(frames, work / "sheets")
+        return {
+            "video_path": video, "meta": meta, "duration": duration,
+            "eff_start": eff_start, "eff_end": eff_end, "eff_duration": eff_duration,
+            "target": target, "budget": budget, "frames": frames, "frame_meta": frame_meta,
+            "cue_frames": cue_frames, "cue_meta": cue_meta, "sheets": sheets,
+        }
+
+    t0 = time.monotonic()
+    visual_error: str | None = None
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        transcript_future = pool.submit(transcript_lane)
+        visual_future = pool.submit(visual_lane)
+        try:
+            visual = visual_future.result()
+        except SystemExit as exc:
+            # A failed download should not throw away a transcript we already
+            # have: report what exists and say what is missing.
+            visual, visual_error = {}, str(exc)
+            print(f"[watch] frames unavailable: {visual_error}", file=sys.stderr)
+        transcript = transcript_future.result()
+    print(f"[watch] done in {time.monotonic() - t0:.1f}s", file=sys.stderr)
+    if visual_error and not transcript.get("segments"):
+        raise SystemExit(visual_error)
+
+    info = dict(probed["info"])
+    if cache_hit:
+        for key in ("title", "uploader"):
+            info[key] = info.get(key) or cached.get(key)
+    if not url_source:
+        info.setdefault("title", Path(args.source).name)
+
+    meta = visual.get("meta") or {"width": None, "height": None, "codec": None, "has_audio": False}
+    full_duration = (
+        visual.get("duration")
+        or float(info.get("duration") or 0)
+        or float((cached or {}).get("duration") or 0)
+    )
+    if not visual and not url_source:
+        full_duration = full_duration or get_metadata(args.source)["duration_seconds"]
+    effective_start = visual.get("eff_start", start_sec or 0.0)
+    effective_end = visual.get("eff_end", end_sec if end_sec is not None else full_duration)
+    effective_duration = visual.get("eff_duration", max(0.0, effective_end - effective_start))
+    target = visual.get("target", 0)
+    detail_budget = visual.get("budget", max_frames)
+    frames = visual.get("frames", [])
+    frame_meta = visual.get("frame_meta", {"engine": "none", "candidate_count": 0, "selected_count": 0})
+    cue_frames = visual.get("cue_frames", [])
+    cue_meta = visual.get("cue_meta", {})
+    sheets = visual.get("sheets", [])
+
+    all_transcript_segments = list(transcript.get("segments") or [])
+    transcript_source = transcript.get("source")
+    transcript_lang = transcript.get("lang")
+    had_captions = bool(transcript.get("had_captions"))
+    transcript_segments = (
+        filter_range(all_transcript_segments, start_sec, end_sec) if focused else all_transcript_segments
+    )
+    transcript_text = format_transcript(transcript_segments) if transcript_segments else None
+    if not transcript_segments and not whisper_ready and not cache_hit:
+        hint = (
+            f"--whisper {args.whisper} was set but the matching API key is missing"
+            if args.whisper else
+            "no subtitles and no Whisper API key found"
+        )
+        if not args.no_whisper:
             print(
-                f"[watch] {hint} — run `python3 {setup_py}` to enable the Whisper fallback",
+                f"[watch] {hint} — run `python3 {SCRIPT_DIR / 'setup.py'}` to enable the Whisper fallback",
                 file=sys.stderr,
             )
-    elif not transcript_segments and video_path and not meta.get("has_audio"):
-        print("[watch] no audio stream found — proceeding without transcription", file=sys.stderr)
-
-    info = dl.get("info") or {}
 
     if use_cache and not cache_hit and all_transcript_segments:
         saved = transcript_cache.save(cache_key, {
@@ -372,10 +436,12 @@ def main() -> int:
     range_mode = "focused" if focused else "full"
     print(f"- **Detail:** {detail}")
     detail_count = frame_meta.get("selected_count", 0)
-    if detail != "transcript":
+    if visual_error:
+        print(f"- **Frames:** unavailable — {visual_error}. Answer from the transcript and say so.")
+    elif detail != "transcript":
         cap_label = "unlimited" if detail_budget is None else str(detail_budget)
         engine = frame_meta.get("engine", "scene")
-        fallback = " with uniform fallback" if frame_meta.get("fallback") else ""
+        fallback = " with uniform fallback" if frame_meta.get("engine") == "uniform" else ""
         deduped = frame_meta.get("deduped_count", 0)
         dedup_note = f", {deduped} near-duplicate{'s' if deduped != 1 else ''} dropped" if deduped else ""
         print(
@@ -424,12 +490,30 @@ def main() -> int:
     print()
     print("## Frames")
     print()
-    if frames:
-        print(f"Frames live at: `{work / 'frames'}`")
+    if sheets:
+        per = len(sheets[0]["frames"])
+        print(
+            f"**Read every sheet below — all of them in one message, as parallel Read calls.** "
+            f"Each sheet tiles up to {per} frames left→right, top→bottom, and every tile is "
+            "stamped with its absolute timestamp in the source video."
+        )
+        print()
+        for sheet in sheets:
+            stamps = " · ".join(format_label(f["timestamp_seconds"]) for f in sheet["frames"])
+            print(f"- `{sheet['path']}` ({sheet['grid']}): {stamps}")
         print()
         print(
-            "**Read each frame path below with the Read tool to view the image.** "
-            "Frames are in chronological order; `t=MM:SS` is the absolute timestamp in the source video."
+            f"Each tile also exists full-size in `{work / 'frames'}` — Read one only when you "
+            "need to zoom in on small text:"
+        )
+        print()
+        print(" · ".join(
+            f"{format_label(f['timestamp_seconds'])} `{Path(f['path']).name}`" for f in frames
+        ))
+    elif frames:
+        print(
+            "**Read every frame path below — all of them in one message, as parallel Read "
+            "calls.** Frames are chronological; `t=MM:SS` is the absolute timestamp in the source video."
         )
         print()
         for frame in frames:
@@ -439,6 +523,9 @@ def main() -> int:
             )
     else:
         print("_No frames extracted._")
+    if visual.get("video_path"):
+        print()
+        print(f"Video file (reuse it for a `--timestamps` or `--start/--end` re-run): `{visual['video_path']}`")
 
     print()
     print("## Transcript")
@@ -459,7 +546,7 @@ def main() -> int:
             "unavailable or failed, so there is no visual fallback here. Re-run with "
             "`--detail balanced` for frames._"
         )
-    elif focused and dl.get("subtitle_path"):
+    elif focused and had_captions:
         print(f"_No transcript lines fell inside {format_time(effective_start)} → {format_time(effective_end)}._")
     else:
         setup_py = SCRIPT_DIR / "setup.py"
@@ -506,7 +593,7 @@ def main() -> int:
 
     print()
     print("---")
-    print(f"_Work dir: `{work}` — delete when done._")
+    print(f"_Work dir: `{work}` — temp work dirs are deleted automatically after {STALE_WORKDIR_HOURS} h._")
 
     return 0
 

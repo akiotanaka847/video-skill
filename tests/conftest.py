@@ -81,3 +81,36 @@ def static_clip(tmp_path_factory: pytest.TempPathFactory) -> Path:
     path = tmp_path_factory.mktemp("clips") / "static.mp4"
     build_static_clip(path)
     return path
+
+
+def build_sparse_keyframe_clip(
+    path: Path,
+    n: int = 12,
+    seg: float = 3.0,
+    size: str = "160x120",
+    fps: int = 5,
+) -> None:
+    """``n`` hard cuts but a single keyframe: what some screen recorders write.
+
+    Keyframe-only scene detection cannot see these cuts, so the engine must
+    notice the sparse keyframes and fall back to the full decode.
+    """
+    inputs: list[str] = []
+    for i in range(n):
+        inputs += ["-f", "lavfi", "-t", str(seg), "-i", f"color=c={COLORS[i % len(COLORS)]}:s={size}:r={fps}"]
+    streams = "".join(f"[{i}:v]" for i in range(n))
+    _run([
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+        *inputs,
+        "-filter_complex", f"{streams}concat=n={n}:v=1:a=0[out]", "-map", "[out]",
+        "-c:v", "libx264", "-pix_fmt", "yuv420p",
+        "-x264-params", "keyint=100000:min-keyint=100000:scenecut=0",
+        str(path),
+    ])
+
+
+@pytest.fixture(scope="session")
+def sparse_key_clip(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    path = tmp_path_factory.mktemp("clips") / "sparse.mp4"
+    build_sparse_keyframe_clip(path)
+    return path

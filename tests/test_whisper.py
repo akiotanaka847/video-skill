@@ -155,3 +155,66 @@ class TestTranscribeChunks:
 
         with pytest.raises(SystemExit):
             whisper.transcribe_chunks(chunks, always_fail)
+
+
+class TestParallelChunking:
+    def test_duration_cap_splits_audio_that_fits_by_size(self):
+        plan = whisper.plan_chunks(total_seconds=1800.0, total_bytes=5 * MB, max_seconds=600.0)
+        assert len(plan) == 3
+        assert plan[0] == (0.0, 600.0)
+        assert sum(d for _, d in plan) == pytest.approx(1800.0)
+
+    def test_short_audio_stays_one_chunk(self):
+        assert whisper.plan_chunks(total_seconds=300.0, total_bytes=2 * MB, max_seconds=600.0) == [(0.0, 300.0)]
+
+    def test_size_cap_still_wins_when_stricter(self):
+        plan = whisper.plan_chunks(total_seconds=1200.0, total_bytes=71 * MB, max_bytes=24 * MB, max_seconds=600.0)
+        assert len(plan) == 3
+
+    def test_cuts_snap_to_nearby_pauses(self):
+        plan = [(0.0, 600.0), (600.0, 600.0), (1200.0, 600.0)]
+        snapped = whisper.snap_plan(plan, silences=[590.0, 1213.5, 1500.0])
+        assert [o for o, _ in snapped] == [0.0, 590.0, 1213.5]
+        assert sum(d for _, d in snapped) == pytest.approx(1800.0)
+
+    def test_cut_without_nearby_pause_stays_put(self):
+        plan = [(0.0, 600.0), (600.0, 600.0)]
+        assert whisper.snap_plan(plan, silences=[100.0, 1100.0]) == plan
+
+    def test_snapping_never_reorders_chunks(self):
+        plan = [(0.0, 10.0), (10.0, 10.0), (20.0, 10.0)]
+        snapped = whisper.snap_plan(plan, silences=[19.0], window=20.0)
+        offsets = [o for o, _ in snapped]
+        assert offsets == sorted(offsets) and len(set(offsets)) == 3
+        assert all(d > 0 for _, d in snapped)
+
+    def test_finds_pauses_in_real_audio(self, tmp_path: Path):
+        audio = tmp_path / "gap.mp3"
+        # tone 2 s, silence 2 s, tone 2 s → one pause centred near 3 s
+        subprocess.run([
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+            "-f", "lavfi", "-i", "sine=frequency=440:duration=2",
+            "-f", "lavfi", "-i", "anullsrc=r=16000:cl=mono:d=2",
+            "-f", "lavfi", "-i", "sine=frequency=440:duration=2",
+            "-filter_complex", "[0:a]aresample=16000,aformat=channel_layouts=mono[a];"
+                               "[2:a]aresample=16000,aformat=channel_layouts=mono[c];"
+                               "[a][1:a][c]concat=n=3:v=0:a=1",
+            str(audio),
+        ], check=True)
+        pauses = whisper.find_silences(audio)
+        assert len(pauses) == 1 and pauses[0] == pytest.approx(3.0, abs=0.3)
+
+    def test_chunks_run_concurrently_but_stay_in_order(self):
+        import threading
+        import time
+        chunks = [(Path(f"{i}.mp3"), i * 100.0) for i in range(4)]
+        started = threading.Barrier(4, timeout=5)
+
+        def slow_first(path: Path) -> list[dict]:
+            started.wait()  # deadlocks unless all four run at once
+            time.sleep(0.2 if path.stem == "0" else 0.0)  # first finishes last
+            return [{"start": 0.0, "end": 1.0, "text": path.stem}]
+
+        out = whisper.transcribe_chunks(chunks, slow_first, max_workers=4)
+        assert [seg["text"] for seg in out] == ["0", "1", "2", "3"]
+        assert [seg["start"] for seg in out] == [0.0, 100.0, 200.0, 300.0]

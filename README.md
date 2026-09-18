@@ -21,21 +21,25 @@ vídeos sin subtítulos.
 
 | Skill | Qué hace | Docs |
 |---|---|---|
-| [`/watch`](plugins/watch/skills/watch/SKILL.md) | Ver un vídeo: frames + transcripción, con soporte de español, caché y notas | [diseño](implementation/watch-diseno.md) |
+| [`/watch`](plugins/watch/skills/watch/SKILL.md) | Ver un vídeo: hojas de frames con marca de tiempo + transcripción en el idioma original, caché y notas | [diseño](implementation/watch-diseno.md) |
 
 ## Qué resuelve
 
 La mayoría de herramientas de vídeo asumen inglés: piden los subtítulos en inglés
 y, si el vídeo está en español, se quedan sin captions y caen a transcripción de
-pago. Aquí el idioma es configurable de punta a punta.
+pago. Aquí se elige la pista en el idioma del propio vídeo, y se prioriza la
+velocidad: un webinar de 55 minutos se procesa en ~12 s y Claude lo ve en seis
+imágenes.
 
-Cuatro capacidades:
+Cinco capacidades:
 
 1. **Español de primera** — `WATCH_SUB_LANGS` (por defecto `es,en`), y para Whisper
    `--whisper-lang` y `--glossary` con tu vocabulario de dominio.
 2. **Caché de transcripciones** — re-ver un vídeo es gratis e instantáneo.
 3. **Persistencia** — `--save` escribe una nota markdown en tu repo e indexa el README.
 4. **Modo lote** — expande playlists y listas de URLs.
+5. **Rápido** — escenas sobre keyframes, descarga a la medida, transcripción y
+   frames en paralelo, y hojas de contacto de hasta 9 frames por lectura.
 
 ## Uso rápido
 
@@ -93,7 +97,7 @@ python3 -m venv .venv && .venv/bin/pip install pytest
 .venv/bin/python -m pytest tests/ -q
 ```
 
-125 tests, sin red y sin binarios reales — los tests de preflight usan stubs en
+185 tests, sin red — los tests de preflight usan stubs en
 el `PATH`, así que pasan en una máquina limpia y en CI.
 
 ## Licencia

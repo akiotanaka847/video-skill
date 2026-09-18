@@ -13,6 +13,8 @@ from __future__ import annotations
 import io
 import json
 import math
+import re
+from concurrent.futures import ThreadPoolExecutor
 import mimetypes
 import os
 import shutil
@@ -35,23 +37,39 @@ OPENAI_MODEL = "whisper-1"
 # Both Groq's free tier and OpenAI whisper-1 cap uploads at 25 MB. We target a
 # margin under that so multipart framing overhead never pushes a chunk over.
 MAX_UPLOAD_BYTES = 24 * 1024 * 1024
+# Long audio is also split by time so the pieces transcribe in parallel: the
+# wall time becomes one chunk's round trip instead of the sum of all of them.
+MAX_CHUNK_SECONDS = 600.0
+# Upper bound on simultaneous uploads. Groq's free tier allows 20 requests a
+# minute; four in flight stays well clear of it even with retries.
+MAX_PARALLEL_CHUNKS = 4
+# Cut points move to the middle of the nearest pause within this many seconds,
+# so a chunk boundary does not split a word Whisper then mishears twice.
+SILENCE_SNAP_WINDOW = 20.0
+SILENCE_RE = re.compile(r"silence_(start|end): (-?[0-9.]+)")
 
 
 def plan_chunks(
     total_seconds: float,
     total_bytes: int,
     max_bytes: int = MAX_UPLOAD_BYTES,
+    max_seconds: float | None = None,
 ) -> list[tuple[float, float]]:
     """Split a duration into contiguous (offset, duration) chunks under max_bytes.
 
     Size scales linearly with duration (constant-bitrate mono mp3), so an even
     time split yields evenly-sized chunks. Returns a single full-length chunk
-    when the audio already fits.
+    when the audio already fits. ``max_seconds`` additionally caps each chunk's
+    length, for parallel transcription.
     """
-    if total_bytes <= max_bytes or total_seconds <= 0:
+    if total_seconds <= 0:
+        return [(0.0, total_seconds)]
+    n = math.ceil(total_bytes / max_bytes) if total_bytes > max_bytes else 1
+    if max_seconds:
+        n = max(n, math.ceil(total_seconds / max_seconds))
+    if n <= 1:
         return [(0.0, total_seconds)]
 
-    n = math.ceil(total_bytes / max_bytes)
     chunk = total_seconds / n
     plan: list[tuple[float, float]] = []
     for i in range(n):
@@ -162,6 +180,48 @@ def audio_duration(audio_path: Path) -> float:
         raise SystemExit(f"ffprobe failed: {result.stderr.strip()}")
     fmt = json.loads(result.stdout or "{}").get("format", {})
     return float(fmt.get("duration") or 0.0)
+
+
+def find_silences(audio_path: Path, noise_db: int = -35, min_seconds: float = 0.3) -> list[float]:
+    """Midpoints of the pauses in ``audio_path`` (seconds). [] if detection fails."""
+    result = subprocess.run(
+        ["ffmpeg", "-hide_banner", "-nostats", "-i", str(audio_path),
+         "-af", f"silencedetect=noise={noise_db}dB:d={min_seconds}", "-f", "null", "-"],
+        capture_output=True, text=True,
+    )
+    midpoints: list[float] = []
+    start: float | None = None
+    for kind, value in SILENCE_RE.findall(result.stderr):
+        if kind == "start":
+            start = max(0.0, float(value))
+        elif start is not None:
+            midpoints.append((start + float(value)) / 2)
+            start = None
+    return midpoints
+
+
+def snap_plan(
+    plan: list[tuple[float, float]],
+    silences: list[float],
+    window: float = SILENCE_SNAP_WINDOW,
+) -> list[tuple[float, float]]:
+    """Move each internal cut to the nearest pause within ``window`` seconds."""
+    if len(plan) < 2 or not silences:
+        return plan
+    total = plan[-1][0] + plan[-1][1]
+    cuts = []
+    for offset, _ in plan[1:]:
+        near = [t for t in silences if abs(t - offset) <= window]
+        cuts.append(min(near, key=lambda t: abs(t - offset)) if near else offset)
+    # A snap must never reorder or collapse chunks.
+    bounds = [0.0]
+    for cut in cuts:
+        bounds.append(cut if cut > bounds[-1] + 1.0 else bounds[-1] + 1.0)
+    bounds.append(total)
+    return [
+        (round(bounds[i], 3), round(bounds[i + 1] - bounds[i], 3))
+        for i in range(len(bounds) - 1)
+    ]
 
 
 def split_audio(
@@ -391,17 +451,25 @@ def _segments_from_response(data: dict) -> list[dict]:
 def transcribe_chunks(
     chunks: list[tuple[Path, float]],
     transcribe_one,
+    max_workers: int = MAX_PARALLEL_CHUNKS,
 ) -> list[dict]:
-    """Transcribe each chunk, shift its segments by the chunk offset, concatenate.
+    """Transcribe chunks in parallel, shift each by its offset, concatenate in order.
 
     A chunk that fails after its own retries is logged and skipped so one bad
     slice doesn't discard the whole transcript. Raises only if every chunk fails.
     """
+    def run(item: tuple[Path, float]) -> list[dict]:
+        return transcribe_one(item[0])
+
+    workers = max(1, min(max_workers, len(chunks)))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = [pool.submit(run, item) for item in chunks]
+
     segments: list[dict] = []
     failures = 0
-    for index, (path, offset) in enumerate(chunks):
+    for index, ((_, offset), future) in enumerate(zip(chunks, futures)):
         try:
-            chunk_segments = transcribe_one(path)
+            chunk_segments = future.result()
         except SystemExit as exc:
             failures += 1
             print(
@@ -478,18 +546,19 @@ def transcribe_video(
         # stop biasing the decode from chunk 2 onward.
         return _transcribe_file(backend, api_key, path, language, prompt)
 
-    if audio_bytes <= MAX_UPLOAD_BYTES:
+    duration = audio_duration(audio_path)
+    plan = plan_chunks(duration, audio_bytes, MAX_UPLOAD_BYTES, max_seconds=MAX_CHUNK_SECONDS)
+    if len(plan) == 1:
         print(
             f"[watch] audio: {audio_bytes / 1024:.0f} kB — uploading to {backend} Whisper…",
             file=sys.stderr,
         )
         segments = transcribe_one(audio_path)
     else:
-        duration = audio_duration(audio_path)
-        plan = plan_chunks(duration, audio_bytes, MAX_UPLOAD_BYTES)
+        plan = snap_plan(plan, find_silences(audio_path))
         print(
-            f"[watch] audio: {audio_bytes / (1024 * 1024):.0f} MB exceeds "
-            f"{MAX_UPLOAD_BYTES // (1024 * 1024)} MB — splitting into {len(plan)} chunks…",
+            f"[watch] audio: {duration / 60:.0f} min — transcribing {len(plan)} chunks "
+            f"in parallel (cuts snapped to pauses)…",
             file=sys.stderr,
         )
         chunks = split_audio(audio_path, audio_out.parent / "chunks", plan)
