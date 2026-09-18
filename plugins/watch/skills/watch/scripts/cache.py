@@ -24,7 +24,11 @@ if str(SCRIPT_DIR) not in sys.path:
 
 from config import CACHE_DIR  # noqa: E402
 
-CACHE_VERSION = 1
+# Bump whenever the transcript for the same inputs would come out different.
+# v2: the caption track choice now prefers the original language over a
+# machine translation, and rolling YouTube captions are deduplicated — v1
+# entries hold the translated, doubled text and must not be served.
+CACHE_VERSION = 2
 DEFAULT_MAX_AGE_DAYS = 30
 
 

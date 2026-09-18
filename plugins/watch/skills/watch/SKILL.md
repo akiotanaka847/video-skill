@@ -1,7 +1,7 @@
 ---
 name: watch
-version: "1.0.0"
-description: Watch a video (URL or local path). Pulls captions in your configured languages (Spanish-first by default), extracts auto-scaled frames with ffmpeg, falls back to Whisper with a forced language and domain glossary, caches transcripts, and can save a structured markdown note into a knowledge repo.
+version: "1.1.0"
+description: Watch a video (URL or local path). Picks the caption track in the video's own language, downloads only what the frames need, detects scenes from keyframes, and tiles frames into timestamped contact sheets so a 55-minute webinar is read in six images. Falls back to parallel Whisper with a forced language and domain glossary, caches transcripts, and can save a markdown note into a knowledge repo.
 argument-hint: "<video-url-or-path> [question]"
 allowed-tools: Bash, Read, Edit, AskUserQuestion
 homepage: https://github.com/akiotanaka847/video-skill
@@ -12,7 +12,7 @@ user-invocable: true
 
 # /watch
 
-You don't have a video input; this skill gives you one. A Python script gets captions first, optionally downloads the video, extracts frames as JPEGs, gets a timestamped transcript (native captions first, then Whisper as fallback), and prints frame paths. You then `Read` each frame path to see the images and combine them with the transcript to answer the user.
+You don't have a video input; this skill gives you one. A Python script gets the transcript (native captions first, Whisper as fallback) while it downloads the video and extracts frames, then tiles the frames into **contact sheets** with each tile's timestamp burned in. You `Read` the sheets to see the video and combine them with the transcript to answer the user.
 
 ## Resolve `SKILL_DIR` (do this before any command)
 
@@ -30,26 +30,15 @@ fi
 
 On **Windows**, substitute `python` for `python3` — the `python3` command there is the Microsoft Store stub and will not run the script.
 
-## Step 0 — Setup preflight
+## Setup — only when the script asks for it
 
-On the first `/watch` invocation in a session:
+**Do not run a preflight before watching.** Go straight to Step 1; `watch.py` checks what it needs and says so. Setup is for these cases only:
 
-```bash
-python3 "${SKILL_DIR}/scripts/setup.py" --json
-```
+- **The script exits with `… is not installed`** → run `python3 "${SKILL_DIR}/scripts/setup.py"` (installs `yt-dlp`/`ffmpeg` on macOS, prints the command elsewhere), then re-run the same `watch.py` command.
+- **The report says `no Whisper API key`** and the video had no captions → answer from the frames first, then say in one line that a Groq key would add the transcript, and offer the first-run questions below. Ask them only if the user says yes.
+- **The user asks to configure `/watch`** → ask the first-run questions.
 
-Branch on two fields:
-
-- **`can_proceed: true` and `first_run: false`** → proceed to Step 1 without comment.
-- **`first_run: true`** → genuine first-time setup, in this order:
-  1. If `missing_binaries` is non-empty, run `python3 "${SKILL_DIR}/scripts/setup.py"` first and confirm the binaries land. **Do not skip this and jump to preferences.**
-  2. Run the installer again if needed so it scaffolds `~/.config/video-skill/.env` before you write values into it.
-  3. Ask the first-run questions below, write the answers, and set `SETUP_COMPLETE=true`.
-- **`can_proceed: false` and `first_run: false`** → the environment regressed. Run the installer, then proceed. Don't re-ask preferences.
-
-On follow-up calls in the same session use the silent check — `python3 "${SKILL_DIR}/scripts/setup.py" --check`. Exit 0 emits nothing; **do not announce "setup is complete"**. Non-zero: `2` = missing binaries, `3` = first run with no Whisper key, `4` = both.
-
-A missing Whisper key is *encouraged to fix, not required*. Keyless installs are allowed and are never nagged once `SETUP_COMPLETE=true`.
+A missing Whisper key is fine: captioned videos (most of YouTube) never need it. After the questions, write `SETUP_COMPLETE=true` even if the user declined a key, so nothing asks again.
 
 **Config inheritance:** a legacy `~/.config/watch/.env` is read as a fallback, so a Groq/OpenAI key already stored there carries over and does not need to be set up twice. We never write to that file.
 
@@ -81,13 +70,13 @@ Ask these with `AskUserQuestion`, then write the answers into `~/.config/video-s
 python3 "${SKILL_DIR}/scripts/watch.py" "<source>"
 ```
 
-**Step 3 — Read every frame path the script lists.** Read all frames in a single message (parallel tool calls) so you see them together. Frames are chronological with a `t=MM:SS` absolute timestamp.
+**Step 3 — Read every sheet the script lists, all in one message** (parallel Read calls). Each sheet tiles up to nine frames left→right, top→bottom, and every tile shows its absolute timestamp in its top-left corner — cite those. The report also lists each tile's full-size frame; Read one only when you need to zoom in on small text. (With `--no-sheets`, or three frames or fewer, the report lists individual frames instead: read those.)
 
 **Step 4 — answer.** You have two evidence streams: frames (what's on screen) and transcript (what's said). Cite timestamps. If the user asked nothing, summarize structure, key moments, notable visuals, spoken content.
 
 This holds at `transcript` detail too: produce a **summary**, do not paste the raw transcript into chat. Offer it only if explicitly asked.
 
-**Step 5 — clean up.** The script prints a working directory. Delete it with `rm -rf <dir>` unless the user may ask follow-ups.
+There is no cleanup step: temp work dirs are deleted automatically on the next run once they are a day old, so follow-ups within the day can reuse them.
 
 ## Flags
 
@@ -109,10 +98,13 @@ This holds at `transcript` detail too: produce a **summary**, do not paste the r
 | `--whisper groq\|openai` | Force a Whisper backend. |
 | `--no-whisper` | Disable the Whisper fallback entirely. |
 | `--no-dedup` | Keep near-duplicate frames. |
+| `--no-sheets` | List individual frames instead of contact sheets. |
 
 ## Language handling
 
-**Captions are requested in the user's configured languages, in preference order.** The default is `es,en`: a Spanish video with Spanish subtitles returns those captions for free rather than falling through to a paid Whisper call. When several tracks download, the first configured language wins, and a manual track beats an auto-generated `-orig` one.
+**The track that matches what is said wins over a translation.** YouTube offers a machine translation of its own speech recognition in 150+ languages, so "Spanish first" used to mean Spanish MT for an English video — two lossy steps. The script now picks, in order: a human-written track in a preferred language (`WATCH_SUB_LANGS`, default `es,en`); a human-written track in the video's own language; the original-language speech recognition (`<lang>-orig`); any other human track; a machine translation only as a last resort. The report names the choice, e.g. `captions (auto, original language)`.
+
+You read the original fine: answer in the user's language regardless of the transcript's.
 
 **When Whisper is needed, two hints matter:**
 
@@ -177,12 +169,12 @@ Cue frames are additive, pinned (reserved against the cap before the detail engi
 
 - **No transcript available** → captions missing AND (no Whisper key OR Whisper failed). Proceed frames-only and say so. If the video is not in a configured caption language, suggest re-running with `--lang <code>`.
 - **Long video warning** → acknowledge it and offer a focused re-run.
-- **Download fails** → yt-dlp's error goes to stderr. If it's login-required or region-locked, say so plainly; do not keep retrying.
-- **Whisper fails** → error on stderr (likely invalid key or rate limit). Audio over the 25 MB cap is chunked automatically; partial transcripts note dropped chunks. Retry with the other backend via `--whisper openai` / `--whisper groq`.
+- **Download fails** → the script already retries once with a fresh extraction (YouTube intermittently answers 403). If frames still fail but a transcript exists, the report says `Frames: unavailable` — answer from the transcript and say so. If nothing is available the script exits non-zero: login-required or region-locked means say so plainly; do not keep retrying.
+- **Whisper fails** → error on stderr (likely invalid key or rate limit). Audio over 10 minutes is split at pauses and transcribed in parallel; partial transcripts note dropped chunks. Retry with the other backend via `--whisper openai` / `--whisper groq`.
 
 ## Token efficiency
 
-Frames dominate cost. ~80 frames at 512px is roughly 50-80k image tokens. The transcript is cheap. `--resolution 1024` roughly quadruples image tokens per frame — only when the user must read on-screen text.
+Image tokens are billed by pixels (~width × height / 750), so a sheet costs what its tiles would cost separately — sheets save **Read calls**, not image tokens. Each Read is ~50 generated tokens before you see anything; 58 frames were ~3k generated tokens of overhead, the six sheets that replace them are ~300. A 512 px tile is ~180 tokens, so 50 frames ≈ 9k image tokens. The transcript is deduplicated and grouped into ≤10 s blocks (a 55-minute webinar is ~13k tokens). `--resolution 1024` quadruples image tokens per frame and puts two frames per sheet — use it only when the user must read on-screen text.
 
 ## Security & Permissions
 
@@ -191,6 +183,7 @@ Frames dominate cost. ~80 frames at 512px is roughly 50-80k image tokens. The tr
 - Runs `ffmpeg` / `ffprobe` locally to extract JPEG frames and, when needed, mono 16 kHz audio
 - Sends **only the extracted audio clip** to Groq (`api.groq.com`) or OpenAI (`api.openai.com`) when captions are missing and Whisper is enabled
 - Writes working files to a temp dir (or `--out-dir`), transcripts to `~/.cache/video-skill/`, and notes to the `--save` directory
+- Deletes its own temp work dirs once they are more than 24 h old (only dirs carrying its `.watch-workdir` marker)
 - Reads/creates `~/.config/video-skill/.env` (mode `0600`); reads `~/.config/watch/.env` and a cwd `.env` as fallbacks
 
 **What this skill does NOT do:**
@@ -199,6 +192,6 @@ Frames dominate cost. ~80 frames at 512px is roughly 50-80k image tokens. The tr
 - Does not share keys between providers, or log them to stdout, stderr, or output files
 - Does not persist anything outside the paths listed above
 
-**Bundled scripts:** `watch.py` (entry point), `download.py` (yt-dlp), `frames.py` (ffmpeg), `transcribe.py` (caption selection + orchestration), `whisper.py` (Groq/OpenAI), `cache.py` (transcript cache), `notes.py` (markdown notes), `batch.py` (playlist expansion), `setup.py` (preflight + installer).
+**Bundled scripts:** `watch.py` (entry point, runs the transcript and visual lanes in parallel), `download.py` (yt-dlp, caption-track choice), `frames.py` (ffmpeg), `sheets.py` (contact sheets), `transcribe.py` (VTT parsing), `whisper.py` (Groq/OpenAI), `cache.py` (transcript cache), `notes.py` (markdown notes), `batch.py` (playlist expansion), `setup.py` (installer).
 
 Review scripts before first use to verify behavior.
